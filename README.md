@@ -12,6 +12,13 @@ bar:  Rai 4K 11        ← channel/app + volume, click for the remote
 panel: power · mute · −/+ · D-pad · back/home/menu · inputs · apps
 ```
 
+## Install
+
+```bash
+omarchy plugin add https://github.com/meviusisback/omarchy-hisense-tv --enable
+omarchy bar put meviusisback.hisense-tv --section right
+```
+
 ## Requirements
 
 - Omarchy with the Quickshell shell (bar plugin support).

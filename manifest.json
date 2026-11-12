@@ -5,8 +5,11 @@
   "version": "0.1.0",
   "author": "meviusisback",
   "license": "MIT",
+  "repository": "https://github.com/meviusisback/omarchy-hisense-tv",
   "description": "Control a Hisense VIDAA TV from the Omarchy bar: power, volume, D-pad, inputs and app launch over the TV's local MQTT bus — no cloud, no account, no vendor app running.",
-  "kinds": ["bar-widget"],
+  "kinds": [
+    "bar-widget"
+  ],
   "entryPoints": {
     "barWidget": "Panel.qml"
   },
@@ -25,7 +28,10 @@
         "key": "barDisplay",
         "type": "enum",
         "label": "Bar display",
-        "options": ["Status", "Icon"],
+        "options": [
+          "Status",
+          "Icon"
+        ],
         "defaultValue": "Status",
         "description": "Status shows the live channel/app and volume; Icon shows a single glyph."
       },
