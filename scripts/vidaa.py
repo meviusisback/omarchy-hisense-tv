@@ -724,6 +724,9 @@ class TvState:
             if not sid or not all(c.isalnum() or c in "._-" for c in sid):
                 continue
             label = clean_text(entry.get("displayname") or entry.get("sourcename") or sid, 32)
+            # The TV decorates the active source ("TV Channels▶"); the chip
+            # already shows selection with a fill, so drop the marker.
+            label = label.rstrip(" \u25b6\u25c0\u25b2\u25bc")
             out.append({"id": sid, "label": label or sid})
         self.sources = out[:16]
         self.dirty = True

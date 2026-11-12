@@ -70,7 +70,7 @@ Panel {
   }
 
   function barText() {
-    if (!root.barShowsStatus) return "\u25A3"
+    if (!root.barShowsStatus) return root.icoTV
     if (root.displayError !== "" || !root.stateSeen) return "TV"
     var text = root.tvOn ? (root.tv.app || root.tv.channel || "TV") : "TV"
     if (root.showVolume && root.tvOn && typeof root.tv.volume === "number") text += " " + root.tv.volume
@@ -319,6 +319,30 @@ Panel {
   }
 
   // ---------------- remote panel ----------------
+  // Icon tokens are Nerd Font Material Design glyphs, the same family the
+  // built-in panels use for their action rows.
+  readonly property string icoPower: String.fromCodePoint(0xf0425)
+  readonly property string icoVolUp: String.fromCodePoint(0xf075d)
+  readonly property string icoVolDown: String.fromCodePoint(0xf075e)
+  readonly property string icoMute: String.fromCodePoint(0xf075f)
+  readonly property string icoVolume: String.fromCodePoint(0xf057e)
+  readonly property string icoMuted: String.fromCodePoint(0xf0581)
+  readonly property string icoHome: String.fromCodePoint(0xf02dc)
+  readonly property string icoMenu: String.fromCodePoint(0xf035c)
+  readonly property string icoCheck: String.fromCodePoint(0xf012c)
+  readonly property string icoTV: String.fromCodePoint(0xf0502)
+  readonly property string icoUp: String.fromCodePoint(0xf0143)
+  readonly property string icoDown: String.fromCodePoint(0xf0140)
+  readonly property string icoLeft: String.fromCodePoint(0xf0141)
+  readonly property string icoRight: String.fromCodePoint(0xf0142)
+  readonly property string icoApps: String.fromCodePoint(0xf003b)
+  readonly property real tile: Style.space(46)
+
+  function setVolume(level) {
+    var value = Math.max(0, Math.min(100, Math.round(Number(level) || 0)))
+    root.run(["vol", "set", String(value)])
+  }
+
   KeyboardPanel {
     id: panel
     anchorItem: button
@@ -326,8 +350,8 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: panel.loadedContent
-    contentWidth: Style.space(360)
-    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(640))
+    contentWidth: Style.space(380)
+    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(660))
 
     content: PanelKeyCatcher {
       id: keyCatcher
@@ -344,69 +368,209 @@ Panel {
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: parent.top
-        spacing: Style.space(8)
+        spacing: Style.spacing.lg
 
-        PanelSectionHeader {
+        // ---- hero: device icon, what is on screen, on/standby pill ----
+        PanelHero {
           Layout.fillWidth: true
-          text: "Hisense " + (root.tvOn && root.fresh ? "on" : "standby")
+          title: "Hisense TV"
+          meta: root.subtitle
+          detail: root.tvOn && root.fresh ? "ON" : "OFF"
+          iconComponent: Component {
+            BorderSurface {
+              implicitWidth: root.tile
+              implicitHeight: root.tile
+              radius: Style.cornerRadius
+              color: Style.selectedFillFor(root.foreground, root.accent)
+              borderSpec: Border.controlSpec("normal", root.foreground, root.accent)
+              Text {
+                anchors.centerIn: parent
+                text: root.icoTV
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.iconLarge
+                textFormat: Text.PlainText
+              }
+            }
+          }
         }
 
-        Text {
+        // ---- power + volume card ----
+        BorderSurface {
           Layout.fillWidth: true
-          text: root.subtitle
-          color: root.foreground
-          opacity: 0.7
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.bodySmall
-          textFormat: Text.PlainText
-          elide: Text.ElideRight
+          Layout.preferredHeight: controlsRow.implicitHeight + Style.spacing.md * 2
+          radius: Style.cornerRadius
+          color: "transparent"
+          borderSpec: Border.controlSpec("normal", root.foreground, root.accent)
+
+          RowLayout {
+            id: controlsRow
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.leftMargin: Style.spacing.md
+            anchors.rightMargin: Style.spacing.md
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.spacing.sm
+
+            Button {
+              implicitWidth: root.tile
+              implicitHeight: root.tile
+              bordered: true
+              iconText: root.icoPower
+              iconSize: Style.font.iconLarge
+              tooltipText: root.tvOn ? "Power off" : "Power on"
+              foreground: root.foreground
+              active: root.tvOn
+              onClicked: root.power()
+            }
+
+            Button {
+              implicitWidth: root.tile
+              implicitHeight: root.tile
+              bordered: true
+              iconText: root.tv.muted ? root.icoMuted : root.icoVolume
+              iconSize: Style.font.iconLarge
+              tooltipText: root.tv.muted ? "Unmute" : "Mute"
+              foreground: root.foreground
+              active: root.tv.muted === true
+              onClicked: root.run(["vol", "mute"])
+            }
+
+            PanelSlider {
+              id: volumeSlider
+              Layout.fillWidth: true
+              bar: root.bar
+              minimum: 0
+              maximum: 100
+              step: 1
+              integer: true
+              value: typeof root.tv.volume === "number" ? root.tv.volume : 0
+              opacity: root.tvOn ? 1 : 0.5
+              enabled: root.tvOn
+              onReleased: function(v) { root.setVolume(v) }
+              onRightClicked: root.run(["vol", "mute"])
+            }
+
+            Text {
+              text: root.tvOn ? String(Math.round(volumeSlider.liveValue)) : "\u2013"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              horizontalAlignment: Text.AlignRight
+              Layout.preferredWidth: Style.space(28)
+              textFormat: Text.PlainText
+            }
+          }
         }
 
+        // ---- D-pad ----
+        GridLayout {
+          Layout.alignment: Qt.AlignHCenter
+          columns: 3
+          rowSpacing: Style.spacing.xs
+          columnSpacing: Style.spacing.xs
+
+          Item { implicitWidth: root.tile; implicitHeight: root.tile }
+          Button {
+            implicitWidth: root.tile
+            implicitHeight: root.tile
+            bordered: true
+            iconText: root.icoUp
+            iconSize: Style.font.iconLarge
+            tooltipText: "Up"
+            foreground: root.foreground
+            onClicked: root.key("KEY_UP")
+          }
+          Item { implicitWidth: root.tile; implicitHeight: root.tile }
+
+          Button {
+            implicitWidth: root.tile
+            implicitHeight: root.tile
+            bordered: true
+            iconText: root.icoLeft
+            iconSize: Style.font.iconLarge
+            tooltipText: "Left"
+            foreground: root.foreground
+            onClicked: root.key("KEY_LEFT")
+          }
+          Button {
+            implicitWidth: root.tile
+            implicitHeight: root.tile
+            bordered: true
+            text: "OK"
+            foreground: root.foreground
+            onClicked: root.key("KEY_OK")
+          }
+          Button {
+            implicitWidth: root.tile
+            implicitHeight: root.tile
+            bordered: true
+            iconText: root.icoRight
+            iconSize: Style.font.iconLarge
+            tooltipText: "Right"
+            foreground: root.foreground
+            onClicked: root.key("KEY_RIGHT")
+          }
+
+          Item { implicitWidth: root.tile; implicitHeight: root.tile }
+          Button {
+            implicitWidth: root.tile
+            implicitHeight: root.tile
+            bordered: true
+            iconText: root.icoDown
+            iconSize: Style.font.iconLarge
+            tooltipText: "Down"
+            foreground: root.foreground
+            onClicked: root.key("KEY_DOWN")
+          }
+          Item { implicitWidth: root.tile; implicitHeight: root.tile }
+        }
+
+        // ---- navigation tiles ----
         RowLayout {
           Layout.fillWidth: true
-          spacing: Style.space(6)
+          spacing: Style.spacing.sm
+
           Button {
             Layout.fillWidth: true
-            text: root.tvOn ? "Power off" : "Power on"
+            implicitHeight: root.tile
+            bordered: true
+            iconText: root.icoLeft
+            text: "Back"
             foreground: root.foreground
-            onClicked: root.power()
+            onClicked: root.key("KEY_RETURNS")
           }
-          Button { text: "Mute"; foreground: root.foreground; onClicked: root.run(["vol", "mute"]) }
-          Button { text: "Vol \u2212"; foreground: root.foreground; onClicked: root.volume("down") }
-          Button { text: "Vol +"; foreground: root.foreground; onClicked: root.volume("up") }
-        }
-
-        ColumnLayout {
-          Layout.alignment: Qt.AlignHCenter
-          spacing: Style.space(4)
-          Button { Layout.alignment: Qt.AlignHCenter; text: "\u25B2"; foreground: root.foreground; implicitWidth: Style.space(72); onClicked: root.key("KEY_UP") }
-          RowLayout {
-            spacing: Style.space(4)
-            Button { text: "\u25C0"; foreground: root.foreground; implicitWidth: Style.space(72); onClicked: root.key("KEY_LEFT") }
-            Button { text: "OK"; foreground: root.foreground; implicitWidth: Style.space(72); onClicked: root.key("KEY_OK") }
-            Button { text: "\u25B6"; foreground: root.foreground; implicitWidth: Style.space(72); onClicked: root.key("KEY_RIGHT") }
+          Button {
+            Layout.fillWidth: true
+            implicitHeight: root.tile
+            bordered: true
+            iconText: root.icoHome
+            text: "Home"
+            foreground: root.foreground
+            onClicked: root.key("KEY_HOME")
           }
-          Button { Layout.alignment: Qt.AlignHCenter; text: "\u25BC"; foreground: root.foreground; implicitWidth: Style.space(72); onClicked: root.key("KEY_DOWN") }
-        }
-
-        RowLayout {
-          Layout.fillWidth: true
-          spacing: Style.space(6)
-          Button { Layout.fillWidth: true; text: "Back"; foreground: root.foreground; onClicked: root.key("KEY_RETURNS") }
-          Button { Layout.fillWidth: true; text: "Home"; foreground: root.foreground; onClicked: root.key("KEY_HOME") }
-          Button { Layout.fillWidth: true; text: "Menu"; foreground: root.foreground; onClicked: root.key("KEY_MENU") }
+          Button {
+            Layout.fillWidth: true
+            implicitHeight: root.tile
+            bordered: true
+            iconText: root.icoMenu
+            text: "Menu"
+            foreground: root.foreground
+            onClicked: root.key("KEY_MENU")
+          }
         }
 
         PanelSectionHeader { Layout.fillWidth: true; text: "Inputs" }
         Flow {
           Layout.fillWidth: true
-          spacing: Style.space(6)
+          spacing: Style.spacing.sm
           Repeater {
             model: root.sources
             delegate: Button {
               required property var modelData
               text: String(modelData.label || modelData.id || "")
               foreground: root.foreground
+              bordered: true
               active: root.tv.source === modelData.id
               onClicked: root.setSource(String(modelData.id))
             }
@@ -416,13 +580,14 @@ Panel {
         PanelSectionHeader { Layout.fillWidth: true; text: "Apps" }
         Flow {
           Layout.fillWidth: true
-          spacing: Style.space(6)
+          spacing: Style.spacing.sm
           Repeater {
             model: root.apps
             delegate: Button {
               required property var modelData
               text: String(modelData.name || "")
               foreground: root.foreground
+              bordered: true
               onClicked: root.launch(String(modelData.appId))
             }
           }
