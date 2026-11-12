@@ -11,6 +11,7 @@ import os
 import shutil
 import socket
 import ssl
+import struct
 import stat
 import sys
 import tempfile
@@ -56,10 +57,12 @@ class Paths(unittest.TestCase):
 
 class Credentials(unittest.TestCase):
     def test_known_vector(self):
+        # Literals captured from the implementation that actually paired with the
+        # TV: changing PATTERN, TIME_XOR, SALT or the hash chain must fail here.
         cid, user, password = vidaa.credentials(1794515869)
         self.assertEqual(cid, "02:11:22:33:44:55$his$363E21_vidaacommon_001")
-        self.assertEqual(user, "his$%d" % (1794515869 ^ vidaa.TIME_XOR))
-        self.assertRegex(password, r"^[0-9A-F]{32}$")
+        self.assertEqual(user, "his$6239759786162096885")
+        self.assertEqual(password, "06FD421E88045DC4EE79BD8EEBB8A03C")
 
     def test_clock_change_changes_password(self):
         self.assertNotEqual(vidaa.credentials(1000)[2], vidaa.credentials(1001)[2])
@@ -243,6 +246,24 @@ class Codec(unittest.TestCase):
             right.close()
 
 
+class Frames(unittest.TestCase):
+    def test_publish_parts(self):
+        body = struct.pack("!H", 4) + b"/abc" + b"payload"
+        self.assertEqual(vidaa.publish_parts(body), ("/abc", b"payload"))
+
+    def test_publish_parts_rejects_short_and_lying_topic(self):
+        self.assertIsNone(vidaa.publish_parts(b""))
+        self.assertIsNone(vidaa.publish_parts(b"\x00"))
+        self.assertIsNone(vidaa.publish_parts(struct.pack("!H", 500) + b"short"))
+
+    def test_parse_json_bounded(self):
+        self.assertEqual(vidaa.parse_json('{"a": 1}'), {"a": 1})
+        # Deep nesting must not propagate RecursionError into the daemon loop.
+        self.assertIsNone(vidaa.parse_json("[" * 60000 + "]" * 60000))
+        self.assertIsNone(vidaa.parse_json("not json"))
+        self.assertIsInstance(vidaa.parse_json("[" * 2000 + "]" * 2000), list)
+
+
 class StateProjection(unittest.TestCase):
     def test_sleep_and_wake_statetypes(self):
         state = vidaa.TvState()
@@ -286,12 +307,27 @@ class StateProjection(unittest.TestCase):
 
     def test_document_fits_state_cap(self):
         state = vidaa.TvState()
-        state.set_applist([{"name": "App%d" % i, "appId": str(i)} for i in range(200)])
-        state.set_sourcelist([{"sourceid": "HDMI1", "displayname": "x"}] * 16)
-        document = state.document()
-        self.assertLessEqual(len(json.dumps(document)), vidaa.MAX_STATE)
-        self.assertIn("updated", document)
-        self.assertIn("pid", document)
+        # Curated names are what survives set_applist, so pad them to the
+        # per-field limit: a document built only from HDMI1 entries would never
+        # approach MAX_STATE and the truncation branch would stay untested.
+        state.apps = [{"name": ("x" * 40) + str(i), "appId": str(i)} for i in range(30)]
+        state.sources = [{"id": "HDMI1", "label": "y" * 32} for _ in range(16)]
+        state.raw_applist = [{"name": "x" * 40, "appId": str(i), "url": "z" * 120}
+                             for i in range(200)]
+        doc = state.document()
+        self.assertLessEqual(len(json.dumps(doc)), vidaa.MAX_STATE)
+        self.assertIn("updated", doc)
+        self.assertIn("pid", doc)
+
+    def test_document_marks_apps_truncated_when_too_large(self):
+        state = vidaa.TvState()
+        state.apps = [{"name": ("x" * 40) + str(i), "appId": str(i)} for i in range(30)]
+        state.sources = [{"id": "HDMI1", "label": "y" * 32} for _ in range(16)]
+        state.available = False
+        state.code = "tv_unreachable"
+        doc = state.document()
+        self.assertEqual(doc["available"], False)
+        self.assertEqual(doc["code"], "tv_unreachable")
 
 
 class NetFile(Paths):

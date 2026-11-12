@@ -64,6 +64,8 @@ the failure code and the command to run.
   to a key if you want the remote without the mouse).
 - Wheel over the bar icon: volume.
 - Panel: power, mute, volume, D-pad, back/home/menu, inputs, app shortcuts.
+- While the panel is open it owns the keyboard: arrow keys drive the TV's D-pad,
+  Enter/space sends OK, Escape closes the panel.
 - CLI (`scripts/vidaa.py`): `status`, `key <KEY>`, `vol up|down|set N|mute`,
   `source <TV|HDMI1|HDMI2|HDMI3|AVS|MusicSharing>`, `app <id|name>`, `power`,
   `refresh`, `discover`, `set-tv <ip>`, `pair`, `stop`.

@@ -227,7 +227,7 @@ def atomic_write(path: str, data: bytes, mode: int = 0o600) -> None:
 
 def read_bounded(path: str, limit: int) -> bytes:
     with open(path, "rb") as fh:
-        return fh.read(limit + 1)[:limit]
+        return fh.read(limit + 1)
 
 
 def write_state_document(document: dict) -> None:
@@ -241,7 +241,7 @@ def write_state_document(document: dict) -> None:
     atomic_write().
     """
     data = (json.dumps(document) + "\n").encode()
-    if len(data) > 4 * MAX_STATE:
+    if len(data) > MAX_STATE:
         data = (json.dumps({"available": False, "stale": True,
                             "code": "state_too_large"}) + "\n").encode()
     ensure_dir(state_root())
@@ -443,9 +443,14 @@ def _mstr(text: str) -> bytes:
     return struct.pack("!H", len(data)) + data
 
 
-def _recvn(sock, count: int) -> bytes:
+def _recvn(sock, count: int, deadline: float | None = None) -> bytes:
     buf = bytearray()
     while len(buf) < count:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise socket.timeout("packet deadline")
+            sock.settimeout(min(remaining, 1.0))
         chunk = sock.recv(count - len(buf))
         if not chunk:
             raise ConnectionError("eof")
@@ -477,13 +482,14 @@ class Mqtt:
         self.sock.sendall(b"\xc0\x00")
 
     def read(self, timeout: float):
+        deadline = time.monotonic() + timeout
         self.sock.settimeout(timeout)
-        header = _recvn(self.sock, 1)[0]
+        header = _recvn(self.sock, 1, deadline)[0]
         kind = header >> 4
         length = 0
         mult = 1
         for _ in range(4):
-            byte = _recvn(self.sock, 1)[0]
+            byte = _recvn(self.sock, 1, deadline)[0]
             length += (byte & 0x7F) * mult
             if not byte & 0x80:
                 break
@@ -492,12 +498,13 @@ class Mqtt:
             raise Fail("bad_request", "bad remaining length")
         if length > MAX_PACKET:
             raise Fail("bad_request", "packet too large")
-        body = _recvn(self.sock, length) if length else b""
+        body = _recvn(self.sock, length, deadline) if length else b""
         return kind, body
 
 
-def mqtt_open(ip: str, net: dict | None, timeout: float = 5.0) -> Mqtt:
-    cert, key = client_material()
+def mqtt_open(ip: str, net: dict | None, timeout: float = 5.0,
+              material: tuple[bytes, bytes] | None = None) -> Mqtt:
+    cert, key = material or client_material()
     anchor = net["anchor"] if net else None
     ctx = tls_context(anchor, cert, key)
     ts = tv_timestamp(ip)
@@ -553,9 +560,27 @@ def sub_topics(cid: str):
 # state
 # --------------------------------------------------------------------------
 
+def parse_json(raw, default=None):
+    """Untrusted JSON, bounded: deep nesting raises RecursionError, not ValueError."""
+    try:
+        return json.loads(raw)
+    except (ValueError, RecursionError, TypeError):
+        return default
+
+
+def publish_parts(body: bytes):
+    """(topic, payload) of a PUBLISH packet, or None when malformed."""
+    if len(body) < 2:
+        return None
+    tlen = struct.unpack("!H", body[:2])[0]
+    if 2 + tlen > len(body):
+        return None
+    return body[2:2 + tlen].decode("utf-8", "replace"), body[2 + tlen:]
+
+
 def boot_id() -> str:
     try:
-        return read_bounded("/proc/sys/kernel/random/boot_id", 64).decode().strip()[:36]
+        return read_bounded("/proc/sys/kernel/random/boot_id", 64)[:36].decode().strip()
     except OSError:
         return ""
 
@@ -584,12 +609,16 @@ class TvState:
         self.apps = []
         self.sources = []
         self.raw_applist = []
+        self.last_app = ""
+        self.available = False
+        self.code = "tv_unreachable"
         self.updated = 0.0
         self.dirty = False
 
     def summary(self) -> dict:
         return {
-            "available": True,
+            "available": self.available,
+            "code": self.code,
             "power": self.power,
             "statetype": self.statetype,
             "volume": self.volume,
@@ -633,6 +662,9 @@ class TvState:
                     self.channel = clean_text(ch, 40)
             elif st == "remote_launcher":
                 self.app = ""
+                self.channel = ""
+        if st in ("livetv", "sourceswitch"):
+            self.app = ""
         self.dirty = True
 
     def set_volume(self, payload: dict) -> None:
@@ -758,6 +790,7 @@ def daemon_main(lock_fd: int | None, status_fd: int | None) -> int:
     try:
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(sock_path)
+        os.chmod(sock_path, 0o600)
         listener.listen(4)
         listener.setblocking(False)
     finally:
@@ -765,6 +798,8 @@ def daemon_main(lock_fd: int | None, status_fd: int | None) -> int:
 
     state = TvState()
     state.updated = time.time()
+    last_inbound = time.time()
+    ping_sent = 0.0
     write_daemon_status("ready")
     _notify(status_fd, {"state": "ready"})
     write_state_document(state.document())
@@ -789,6 +824,14 @@ def daemon_main(lock_fd: int | None, status_fd: int | None) -> int:
             except (KeyError, ValueError):
                 pass
         mqtt, mqtt_fd = None, None
+        # A dropped link must never leave the cache claiming "live".
+        state.available = False
+        state.code = "tv_unreachable"
+        state.dirty = True
+        try:
+            write_state_document(state.document())
+        except (OSError, Fail):
+            pass
 
     def write_state(force=False):
         nonlocal next_state_write
@@ -805,13 +848,14 @@ def daemon_main(lock_fd: int | None, status_fd: int | None) -> int:
             pass
 
     def handle_publish(topic: str, payload: bytes):
-        try:
-            data = json.loads(payload.decode("utf-8", "replace")) if payload else None
-        except ValueError:
-            return
+        data = parse_json(payload.decode("utf-8", "replace")) if payload else None
         if topic.endswith("/state") and "/ui_service/" in topic:
             if isinstance(data, dict):
                 state.set_statetype(data)
+                if state.statetype == "app" and state.last_app:
+                    state.app = state.last_app
+                    state.channel = ""
+                    state.source = ""
         elif topic.endswith("/volumechange") or topic.endswith("/ui_service/volume"):
             if isinstance(data, dict):
                 state.set_volume(data)
@@ -825,19 +869,28 @@ def daemon_main(lock_fd: int | None, status_fd: int | None) -> int:
             state.set_sourcelist(data)
 
     def connect():
-        nonlocal mqtt, mqtt_fd, next_ping, next_refresh, backoff
-        mqtt = mqtt_open(ip, load_net(), timeout=4.0)
-        mqtt.subscribe(sub_topics(cid))
-        mqtt.publish("/remoteapp/tv/ui_service/%s/actions/gettvstate" % cid, "")
-        mqtt.publish("/remoteapp/tv/platform_service/%s/actions/getvolume" % cid, "")
-        mqtt.publish("/remoteapp/tv/ui_service/%s/actions/applist" % cid, "")
-        mqtt.publish("/remoteapp/tv/ui_service/%s/actions/sourcelist" % cid, "")
+        nonlocal mqtt, mqtt_fd, next_ping, next_refresh, backoff, last_inbound
+        session = mqtt_open(ip, load_net(), timeout=4.0)
+        try:
+            session.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            session.subscribe(sub_topics(cid))
+            session.publish("/remoteapp/tv/ui_service/%s/actions/gettvstate" % cid, "")
+            session.publish("/remoteapp/tv/platform_service/%s/actions/getvolume" % cid, "")
+            session.publish("/remoteapp/tv/ui_service/%s/actions/applist" % cid, "")
+            session.publish("/remoteapp/tv/ui_service/%s/actions/sourcelist" % cid, "")
+        except (OSError, ssl.SSLError, Fail) as exc:
+            session.close()
+            raise Fail(getattr(exc, "code", "tv_unreachable"), "subscribe: %s" % type(exc).__name__)
+        mqtt = session
         sel.register(mqtt.sock, selectors.EVENT_READ)
         mqtt_fd = mqtt.sock.fileno()
+        last_inbound = time.time()
         next_ping = time.time() + PING_EVERY
         next_refresh = time.time() + STATE_REFRESH
         backoff = 1.0
         write_daemon_status("ready")
+        state.available = True
+        state.code = ""
         state.dirty = True
 
     def reply(conn, payload: dict):
@@ -860,6 +913,14 @@ def daemon_main(lock_fd: int | None, status_fd: int | None) -> int:
         rid = payload.get("id")
         cmd = payload.get("cmd")
         base = {"id": rid, "ok": True, "delivered": False}
+        if cmd == "status":
+            base.update({"state": state.summary()})
+            return base
+        if cmd == "shutdown":
+            nonlocal stopping
+            stopping = True
+            base["delivered"] = True
+            return base
         if mqtt is None:
             base.update({"ok": False, "code": "tv_unreachable"})
             return base
@@ -890,7 +951,8 @@ def daemon_main(lock_fd: int | None, status_fd: int | None) -> int:
                     return {"id": rid, "ok": False, "code": "bad_request"}
             elif cmd == "source":
                 src = payload.get("source")
-                if src not in SOURCES:
+                known = src in SOURCES or any(entry.get("id") == src for entry in state.sources)
+                if not known or not isinstance(src, str):
                     return {"id": rid, "ok": False, "code": "bad_request"}
                 mqtt.publish(ui + "changesource", json.dumps({"sourceid": src}))
             elif cmd == "app":
@@ -905,6 +967,7 @@ def daemon_main(lock_fd: int | None, status_fd: int | None) -> int:
                 mqtt.publish(ui + "launchapp", json.dumps(
                     {"appId": entry["appId"], "name": entry["name"],
                      "url": entry.get("url") or entry["name"], "storeType": 99}))
+                state.last_app = entry["name"]
             elif cmd == "power":
                 mqtt.publish("/remoteapp/tv/remote_service/%s/actions/sendkey" % cid, "KEY_POWER")
             elif cmd == "refresh":
@@ -913,13 +976,6 @@ def daemon_main(lock_fd: int | None, status_fd: int | None) -> int:
                 mqtt.publish(ui + "applist", "")
                 mqtt.publish(ui + "sourcelist", "")
                 next_refresh = time.time() + STATE_REFRESH
-            elif cmd == "status":
-                base.update({"state": state.summary()})
-                return base
-            elif cmd == "shutdown":
-                stopping = True
-                base["delivered"] = True
-                return base
             else:
                 return {"id": rid, "ok": False, "code": "bad_request"}
             base["delivered"] = True
@@ -941,6 +997,9 @@ def daemon_main(lock_fd: int | None, status_fd: int | None) -> int:
                         write_state_document({"available": False, "stale": True,
                                               "code": exc.code, "updated": int(time.time())})
                         return EXIT.get(exc.code, 78)
+                    state.available = False
+                    state.code = exc.code
+                    state.dirty = True
                     next_attempt = now + backoff
                     backoff = min(backoff * 2, 30.0) * (1 + os.urandom(1)[0] / 2550.0)
 
@@ -952,7 +1011,7 @@ def daemon_main(lock_fd: int | None, status_fd: int | None) -> int:
             for key, _mask in events:
                 if mqtt and key.fileobj is mqtt.sock:
                     try:
-                        kind, body = mqtt.read(1.0)
+                        kind, body = mqtt.read(2.0)
                     except socket.timeout:
                         disconnect()
                         next_attempt = time.time() + 1.0
@@ -961,15 +1020,29 @@ def daemon_main(lock_fd: int | None, status_fd: int | None) -> int:
                         disconnect()
                         next_attempt = time.time() + 1.0
                         continue
-                    if kind == 3 and len(body) >= 2:
-                        tlen = struct.unpack("!H", body[:2])[0]
-                        if 2 + tlen <= len(body):
-                            topic = body[2:2 + tlen].decode("utf-8", "replace")
-                            handle_publish(topic, body[2 + tlen:])
+                    last_inbound = time.time()
+                    if kind == 13:
+                        ping_sent = 0.0
+                    elif kind == 3:
+                        parts = publish_parts(body)
+                        if parts:
+                            handle_publish(parts[0], parts[1])
                 elif key.fileobj is listener:
                     try:
                         conn, _ = listener.accept()
                     except OSError:
+                        continue
+                    # Same-uid only: the socket's mode is the primary guard,
+                    # SO_PEERCRED is the one that cannot be bypassed by a
+                    # pre-created path.
+                    try:
+                        creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+                        _pid, peer_uid, _gid = struct.unpack("3i", creds)
+                        if peer_uid != os.getuid():
+                            conn.close()
+                            continue
+                    except OSError:
+                        conn.close()
                         continue
                     conn.settimeout(2.0)
                     try:
@@ -982,7 +1055,7 @@ def daemon_main(lock_fd: int | None, status_fd: int | None) -> int:
                         if len(raw) > MAX_REQUEST:
                             reply(conn, {"ok": False, "code": "bad_request"})
                             continue
-                        request = json.loads(raw.decode("utf-8", "replace") or "{}")
+                        request = parse_json(raw.decode("utf-8", "replace") or "{}")
                         if not isinstance(request, dict):
                             reply(conn, {"ok": False, "code": "bad_request"})
                             continue
@@ -995,9 +1068,14 @@ def daemon_main(lock_fd: int | None, status_fd: int | None) -> int:
                 if now >= next_ping:
                     try:
                         mqtt.ping()
+                        ping_sent = now
                         next_ping = now + PING_EVERY
                     except OSError:
                         disconnect()
+                if ping_sent and now - ping_sent > PING_EVERY * 1.5:
+                    disconnect()
+                if mqtt is not None and now - last_inbound > STATE_REFRESH * 2:
+                    disconnect()
                 if now >= next_refresh:
                     try:
                         ui = "/remoteapp/tv/ui_service/%s/actions/" % cid
@@ -1121,6 +1199,8 @@ def run_command(request: dict, spawn: bool = True, timeout: float = 3.0) -> dict
 
 
 def _run_command_finish(request: dict, timeout: float, spawned: bool) -> dict:
+    if spawned:
+        timeout = max(timeout, 8.0)
     sock = connect_socket(3.0 if spawned else 2.0)
     if sock is None:
         code = daemon_code()
@@ -1209,25 +1289,33 @@ def stop_daemon(timeout: float = 12.0) -> None:
 
 
 def cmd_pair(args) -> dict:
-    ip = valid_ip(args.tv or (load_config(require_paired=False).get("tvIp") or ""))
-    ensure_dir(config_root())
-    cert_path = os.path.join(config_root(), "client.pem")
-    key_path = os.path.join(config_root(), "client.key")
-    import_material(os.path.expanduser(args.cert), cert_path)
-    import_material(os.path.expanduser(args.key), key_path)
-    os.chmod(cert_path, 0o600)
-    os.chmod(key_path, 0o600)
-    stop_daemon()
+    """Pair without touching a working installation until the TV confirms.
 
-    cert, key = client_material()
+    Everything happens against staged files inside the 0700 config root; the
+    live client.pem/client.key/net.json/config.json and the running daemon are
+    only replaced once the TV accepted the PIN.
+    """
+    ip = valid_ip(args.tv or (load_config(require_paired=False).get("tvIp") or ""))
+    root = ensure_dir(config_root())
+    stage = tempfile.mkdtemp(prefix=".pair-", dir=root)
+    os.chmod(stage, 0o700)
     mqtt = None
     try:
-        # first contact: capture the TV's chain, then prove it verifies against
-        # that anchor before trusting it.
-        ctx = tls_context(None, cert, key)
+        cert_path = os.path.join(stage, "client.pem")
+        key_path = os.path.join(stage, "client.key")
+        import_material(os.path.expanduser(args.cert), cert_path)
+        import_material(os.path.expanduser(args.key), key_path)
+        cert = read_secret(cert_path)
+        key = read_secret(key_path)
+        # A mismatched cert/key only shows up when OpenSSL loads them.
+        tls_context(None, cert, key)
+
+        # First contact: capture the chain, then prove the captured anchor
+        # actually verifies this peer before anything is persisted.
+        probe_ctx = tls_context(None, cert, key)
         try:
             raw = socket.create_connection((ip, TV_PORT), timeout=5)
-            probe = ctx.wrap_socket(raw)
+            probe = probe_ctx.wrap_socket(raw)
         except (OSError, ssl.SSLError) as exc:
             raise Fail("tv_unreachable", "tls: %s" % type(exc).__name__)
         chain = probe.get_unverified_chain() or []
@@ -1238,41 +1326,48 @@ def cmd_pair(args) -> dict:
         anchor_der = chain[1] if len(chain) > 1 else der
         anchor = ssl.DER_cert_to_PEM_cert(anchor_der)
         pin = hashlib.sha256(der).hexdigest()
-        verified = tls_context(anchor, cert, key)
         try:
             raw = socket.create_connection((ip, TV_PORT), timeout=5)
-            check = verified.wrap_socket(raw)
-            check.close()
+            tls_context(anchor, cert, key).wrap_socket(raw).close()
         except (OSError, ssl.SSLError) as exc:
             raise Fail("cert_invalid", "anchor does not verify the TV: %s" % type(exc).__name__)
+
+        print("Pairing with %s" % ip)
         print("TV certificate sha256: %s" % pin)
         if not args.yes:
-            answer = input("Trust this TV? [y/N] ").strip().lower()
+            try:
+                answer = input("Trust this TV? [y/N] ").strip().lower()
+            except EOFError:
+                raise Fail("config", "aborted")
             if answer not in ("y", "yes"):
                 raise Fail("config", "aborted")
 
-        write_json(net_path(), {"pin": pin, "anchor": anchor})
-        mqtt = mqtt_open(ip, {"pin": pin, "anchor": anchor}, timeout=6.0)
+        mqtt = mqtt_open(ip, {"pin": pin, "anchor": anchor}, timeout=6.0,
+                         material=(cert, key))
         cid = credentials(int(time.time()))[0]
         mqtt.subscribe([TOPIC_AUTHS.format(cid=cid), TOPIC_AUTHCODE.format(cid=cid)])
         mqtt.publish("/remoteapp/tv/ui_service/%s/actions/vidaa_app_connect" % cid,
                      json.dumps({"app_version": 2, "connect_result": 0, "device_type": "Mobile App"}))
+
+        def await_response(predicate, timeout: float):
+            end = time.time() + timeout
+            while time.time() < end:
+                try:
+                    kind, body = mqtt.read(max(1.0, end - time.time()))
+                except socket.timeout:
+                    continue
+                if kind != 3:
+                    continue
+                parts = publish_parts(body)
+                if parts and predicate(parts[0]):
+                    return parse_json(parts[1].decode("utf-8", "replace"))
+
+            return None
+
         print("Look at the TV: a 4-digit pairing code should be on screen.")
-        got_prompt = False
-        end = time.time() + 25
-        while time.time() < end:
-            try:
-                kind, body = mqtt.read(1.0)
-            except socket.timeout:
-                continue
-            if kind == 3:
-                tlen = struct.unpack("!H", body[:2])[0]
-                topic = body[2:2 + tlen].decode("utf-8", "replace")
-                if topic.endswith("/data/authentication"):
-                    got_prompt = True
-                    break
-        if not got_prompt:
-            print("(no prompt seen, sending the code anyway)")
+        prompt = await_response(lambda topic: topic.endswith("/data/authentication"), 25)
+        if prompt is None:
+            raise Fail("pairing_required", "no on-screen prompt")
 
         pin_code = os.environ.get("VIDAA_PIN") or ""
         try:
@@ -1284,36 +1379,27 @@ def cmd_pair(args) -> dict:
             raise Fail("bad_request", "4 digits required")
         mqtt.publish("/remoteapp/tv/ui_service/%s/actions/authenticationcode" % cid,
                      json.dumps({"authNum": int(pin_code)}))
-        ok = False
-        end = time.time() + 10
-        while time.time() < end:
-            try:
-                kind, body = mqtt.read(1.0)
-            except socket.timeout:
-                continue
-            if kind != 3:
-                continue
-            tlen = struct.unpack("!H", body[:2])[0]
-            topic = body[2:2 + tlen].decode("utf-8", "replace")
-            if topic.endswith("/data/authenticationcode"):
-                try:
-                    payload = json.loads(body[2 + tlen:].decode())
-                except ValueError:
-                    continue
-                if payload.get("result") == 1:
-                    ok = True
-                    break
-                raise Fail("pairing_required", "code rejected")
-        if not ok:
-            raise Fail("pairing_required", "no confirmation")
+        result = await_response(lambda topic: topic.endswith("/data/authenticationcode"), 10)
+        if not isinstance(result, dict) or result.get("result") != 1:
+            raise Fail("pairing_required", "code rejected")
         mqtt.publish("/remoteapp/tv/ui_service/%s/actions/authenticationcodeclose" % cid, "")
-        write_json(config_path(), {"tvIp": ip, "clientId": cid,
-                                   "pairedAt": time.strftime("%Y-%m-%dT%H:%M:%S")})
+
+        # Confirmed: stage the persistent state, then swap it in.
+        write_json(os.path.join(stage, "net.json"), {"pin": pin, "anchor": anchor})
+        write_json(os.path.join(stage, "config.json"),
+                   {"tvIp": ip, "clientId": cid,
+                    "pairedAt": time.strftime("%Y-%m-%dT%H:%M:%S")})
+        stop_daemon()
+        for name in ("client.pem", "client.key", "net.json", "config.json"):
+            os.replace(os.path.join(stage, name), os.path.join(root, name))
+            os.chmod(os.path.join(root, name), 0o600)
         print("Paired with %s (%s)" % (ip, cid))
         return {"ok": True, "tvIp": ip}
     finally:
         if mqtt:
             mqtt.close()
+        import shutil
+        shutil.rmtree(stage, ignore_errors=True)
 
 
 def discover(timeout: float = 2.0) -> list:
@@ -1464,13 +1550,15 @@ def main(argv) -> int:
                 code = "pairing_required"
             return emit({"ok": False, "code": code}, EXIT.get(code, 69))
         if verb == "stop":
+            if not os.path.exists(socket_path()):
+                return emit({"ok": True, "stopped": True})
             try:
-                reply = run_command({"id": 1, "cmd": "shutdown"}, timeout=2.0)
+                stop_daemon()
             except Fail as exc:
-                if exc.code in ("tv_unreachable", "config"):
-                    return emit({"ok": True, "stopped": True})
-                raise
-            return emit({"ok": bool(reply.get("ok")), "stopped": True})
+                if exc.code not in ("busy",):
+                    raise
+                return emit({"ok": False, "code": exc.code}, EXIT[exc.code])
+            return emit({"ok": True, "stopped": True})
         if verb == "key":
             if args.key not in KEYS:
                 raise Fail("bad_request", "unknown key")

@@ -6,17 +6,14 @@ import qs.Commons
 import qs.Ui
 
 // Hisense VIDAA TV remote in the Omarchy bar.
-// Backend: scripts/vidaa.py — one singleton MQTT daemon (owned by the CLI, not
-// by this QML), state published to a JSON file this widget watches, one-shot
-// CLI calls per key press. Nothing here holds a socket or a long-lived child.
+// Backend: scripts/vidaa.py — one singleton MQTT daemon owned by the CLI, a
+// state file this widget watches, and one-shot CLI calls per key press. No
+// socket, no long-lived child and no TV protocol in this file.
 Panel {
   id: root
 
   moduleName: "meviusisback.hisense-tv"
   ipcTarget: "meviusisback.hisense-tv"
-  // Explicit IPC handler: lets a keybinding (or a test) pop the remote
-  // without a pointer. The Panel base's manageIpc registration is not used,
-  // because a package-relative target must exist even before the first click.
   manageIpc: false
 
   implicitWidth: button.implicitWidth
@@ -26,36 +23,55 @@ Panel {
   readonly property color accent: Color.accent
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
-  // Last good state. Never replaced by a malformed/oversized document.
+  // Last good state. Never replaced by a malformed, oversized or expired
+  // document: a stale cache would otherwise claim the TV is live forever.
   property var tv: ({
     available: false, power: "unknown", statetype: "", volume: null, muted: false,
     source: "", channel: "", app: "", apps: [], sources: [], stale: true
   })
   property bool stateSeen: false
   property string statePath: ""
-  property string errorCode: ""
+  property string errorCode: ""     // carried by the state document
+  property string actionError: ""   // carried by the last control reply
   property bool busy: false
+  property int pendingVolume: 0
+  property string pendingKey: ""
 
   readonly property bool barShowsStatus: String(root.setting("barDisplay", "Status")).toLowerCase() === "status"
   readonly property bool showVolume: root.setting("showVolume", true) === true
+  readonly property string displayError: root.actionError !== "" ? root.actionError : root.errorCode
   readonly property bool tvOn: root.tv && root.tv.power === "on"
-  readonly property bool paired: root.errorCode !== "pairing_required"
   readonly property var sources: (root.tv && root.tv.sources) || []
   readonly property var apps: (root.tv && root.tv.apps) || []
+  readonly property bool fresh: root.stateSeen && !root.tv.stale && root.displayError === ""
 
   readonly property string subtitle: {
-    if (root.errorCode === "pairing_required") return "Not paired"
-    if (root.errorCode === "tv_identity_changed") return "TV certificate changed"
-    if (root.errorCode !== "") return root.errorCode
+    if (root.displayError !== "") return root.codeText(root.displayError)
+    if (!root.stateSeen) return "No data yet"
     if (!root.tvOn) return "Standby"
-    if (root.tv.channel) return root.tv.channel
     if (root.tv.app) return root.tv.app
+    if (root.tv.channel) return root.tv.channel
     return root.tv.source || "On"
+  }
+
+  function codeText(code) {
+    switch (code) {
+    case "pairing_required": return "Not paired — run vidaa.py pair"
+    case "tv_identity_changed": return "TV certificate changed — re-pair"
+    case "cert_permissions": return "Cert/key permissions (need 0600)"
+    case "cert_invalid": return "Cert/key unusable"
+    case "unsafe_dir": return "Unsafe config/state directory"
+    case "tv_unreachable": return "TV unreachable"
+    case "backend_error": return "Backend failed to start"
+    case "bad_request": return "Rejected by the backend"
+    default: return code
+    }
   }
 
   function barText() {
     if (!root.barShowsStatus) return "\u25A3"
-    var text = root.tvOn ? (root.tv.channel || root.tv.app || "TV") : "TV"
+    if (root.displayError !== "" || !root.stateSeen) return "TV"
+    var text = root.tvOn ? (root.tv.app || root.tv.channel || "TV") : "TV"
     if (root.showVolume && root.tvOn && typeof root.tv.volume === "number") text += " " + root.tv.volume
     return text
   }
@@ -68,8 +84,8 @@ Panel {
       const value = Quickshell.env(name) || ""
       if (value !== "") argv.push(name + "=" + value)
     }
-    // Absolute interpreter: the script's exec bit and shebang are not trusted,
-    // and -I ignores PYTHON* variables and the user site directory.
+    // The exec bit and shebang are not trusted: run the script through the
+    // absolute interpreter, isolated (-I) and unbuffered (-u).
     return argv.concat(["/usr/bin/python3", "-I", "-u",
                         Qt.resolvedUrl("scripts/vidaa.py").toString().replace(/^file:\/\//, "")], args)
   }
@@ -82,6 +98,14 @@ Panel {
       return
     }
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return
+    // A document from a previous boot (or from a daemon that died hours ago)
+    // is not live data. Leave stateSeen false so the fallback timer keeps
+    // asking the CLI, which respawns the daemon.
+    var age = typeof parsed.updated === "number" ? (Date.now() / 1000 - parsed.updated) : Infinity
+    if (age < 0 || age > 180) {
+      root.stateSeen = false
+      return
+    }
     var next = {
       available: parsed.available === true,
       power: typeof parsed.power === "string" ? parsed.power : "unknown",
@@ -93,7 +117,7 @@ Panel {
       app: typeof parsed.app === "string" ? parsed.app : "",
       apps: [],
       sources: [],
-      stale: parsed.stale === true
+      stale: parsed.stale === true || parsed.available !== true
     }
     if (Array.isArray(parsed.apps)) {
       for (const entry of parsed.apps.slice(0, 30)) {
@@ -109,25 +133,67 @@ Panel {
           next.sources.push({ id: entry.id, label: entry.label.slice(0, 32) })
       }
     }
-    var code = typeof parsed.code === "string" ? parsed.code : ""
-    if (parsed.available !== true) code = code || "tv_unreachable"
-    root.errorCode = code
+    root.errorCode = typeof parsed.code === "string" ? parsed.code : ""
+    if (next.stale && root.errorCode === "") root.errorCode = "tv_unreachable"
     root.tv = next
     root.stateSeen = true
   }
 
-  function run(args) {
-    if (root.busy) return
+  // One action at a time: discrete presses are dropped while busy, volume and
+  // D-pad input are coalesced so a fast wheel/tap burst is not lost.
+  function start(args) {
     root.busy = true
     actionProc.command = root.cliArgv(args)
     actionProc.running = true
   }
 
-  function key(name) { root.run(["key", name]) }
-  function volume(action) { root.run(["vol", action]) }
+  function run(args) {
+    if (root.busy) return
+    root.start(args)
+  }
+
+  function queueVolume(step) {
+    root.pendingVolume += step
+    root.pump()
+  }
+
+  function queueKey(name) {
+    root.pendingKey = name
+    root.pump()
+  }
+
+  function pump() {
+    if (root.busy) return
+    if (root.pendingVolume !== 0) {
+      var step = root.pendingVolume
+      root.pendingVolume = 0
+      root.start(["vol", step > 0 ? "up" : "down"])
+      return
+    }
+    if (root.pendingKey !== "") {
+      var name = root.pendingKey
+      root.pendingKey = ""
+      root.start(["key", name])
+    }
+  }
+
+  function key(name) { root.queueKey(name) }
+  function volume(action) {
+    if (action === "up") root.queueVolume(1)
+    else if (action === "down") root.queueVolume(-1)
+    else root.run(["vol", action])
+  }
   function setSource(id) { root.run(["source", id]) }
   function launch(appId) { root.run(["app", appId]) }
   function power() { root.run(["power"]) }
+
+  IpcHandler {
+    target: "meviusisback.hisense-tv"
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function toggle(): void { root.toggle() }
+    function refresh(): void { root.run(["status"]) }
+  }
 
   // The CLI validates the runtime/state dirs and prints the path it will use;
   // this widget never derives one from an environment variable itself.
@@ -154,15 +220,16 @@ Panel {
     printErrors: false
     onLoadFailed: { /* no state yet: keep the previous one */ }
     onLoaded: root.readState()
+    // text() is stale inside the change signal, so reload() first.
     onFileChanged: reload()
   }
 
-  // Only while the daemon has never published a state file: re-ask for the
-  // path and refresh, slowly. Inert in a normal session.
+  // Only while no fresh state exists: re-ask for the path and refresh, slowly.
+  // This is also what starts the daemon after a reboot.
   Timer {
     interval: 30000
     repeat: true
-    running: root.statePath === "" || !root.stateSeen
+    running: !root.stateSeen || root.displayError !== ""
     onTriggered: {
       if (root.statePath === "") statePathProc.running = true
       root.run(["status"])
@@ -176,25 +243,20 @@ Panel {
       onStreamFinished: {
         try {
           const parsed = JSON.parse(text || "{}")
-          if (parsed && parsed.ok === false && typeof parsed.code === "string")
-            root.errorCode = parsed.code
-          else if (parsed && parsed.ok === true)
-            root.errorCode = ""
-        } catch (e) { /* ignore: the state file is the source of truth */ }
+          if (parsed && parsed.ok === false) root.actionError = String(parsed.code || "bad_request")
+          else if (parsed && parsed.ok === true) root.actionError = ""
+          else root.actionError = "backend_error"
+        } catch (e) {
+          root.actionError = "backend_error"
+        }
       }
     }
-    onExited: {
+    onExited: function(exitCode) {
       root.busy = false
+      if (exitCode !== 0 && root.actionError === "") root.actionError = "backend_error"
+      root.pump()
       stateView.reload()
     }
-  }
-
-  IpcHandler {
-    target: "meviusisback.hisense-tv"
-    function open(): void { root.open() }
-    function close(): void { root.close() }
-    function toggle(): void { root.toggle() }
-    function refresh(): void { root.run(["status"]) }
   }
 
   // ---------------- bar button ----------------
@@ -206,7 +268,7 @@ Panel {
     bar: root.bar
     text: root.barText()
     tooltipText: "Hisense TV: " + root.subtitle
-    active: root.tvOn
+    active: root.tvOn && root.fresh
     useActiveColor: true
     activeColor: root.accent
     onPressed: function(buttonCode) {
@@ -215,7 +277,7 @@ Panel {
     }
     onWheelMoved: function(delta) {
       if (!root.tvOn) return
-      root.volume(delta > 0 ? "up" : "down")
+      root.queueVolume(delta > 0 ? 1 : -1)
     }
   }
 
@@ -226,108 +288,121 @@ Panel {
     owner: root
     bar: root.bar
     open: root.opened
+    focusTarget: panel.loadedContent
     contentWidth: Style.space(360)
-    // The content is a lazily built component: sizing it from an id inside
-    // that component is not visible in this scope.
-    contentHeight: Style.space(470)
+    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(640))
 
-    content: ColumnLayout {
-      id: column
-      spacing: Style.space(8)
-
-      PanelSectionHeader {
-        Layout.fillWidth: true
-        text: "Hisense " + (root.tvOn ? "on" : "standby")
+    content: PanelKeyCatcher {
+      id: keyCatcher
+      implicitHeight: column.implicitHeight
+      onCloseRequested: root.close()
+      onMoveRequested: function(dx, dy) {
+        if (dy !== 0) root.queueKey(dy < 0 ? "KEY_UP" : "KEY_DOWN")
+        else if (dx !== 0) root.queueKey(dx < 0 ? "KEY_LEFT" : "KEY_RIGHT")
       }
-
-      Text {
-        Layout.fillWidth: true
-        text: root.subtitle
-        color: root.foreground
-        opacity: 0.7
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.bodySmall
-        textFormat: Text.PlainText
-        elide: Text.ElideRight
-      }
-
-      RowLayout {
-        Layout.fillWidth: true
-        spacing: Style.space(6)
-        Button {
-          Layout.fillWidth: true
-          text: root.tvOn ? "Power off" : "Power on"
-          foreground: root.foreground
-          onClicked: root.power()
-        }
-        Button { text: "Mute"; foreground: root.foreground; onClicked: root.volume("mute") }
-        Button { text: "Vol \u2212"; foreground: root.foreground; onClicked: root.volume("down") }
-        Button { text: "Vol +"; foreground: root.foreground; onClicked: root.volume("up") }
-      }
+      onActivateRequested: root.queueKey("KEY_OK")
 
       ColumnLayout {
-        Layout.alignment: Qt.AlignHCenter
-        spacing: Style.space(4)
-        Button { Layout.alignment: Qt.AlignHCenter; text: "\u25B2"; foreground: root.foreground; implicitWidth: Style.space(72); onClicked: root.key("KEY_UP") }
+        id: column
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        spacing: Style.space(8)
+
+        PanelSectionHeader {
+          Layout.fillWidth: true
+          text: "Hisense " + (root.tvOn && root.fresh ? "on" : "standby")
+        }
+
+        Text {
+          Layout.fillWidth: true
+          text: root.subtitle
+          color: root.foreground
+          opacity: 0.7
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          textFormat: Text.PlainText
+          elide: Text.ElideRight
+        }
+
         RowLayout {
+          Layout.fillWidth: true
+          spacing: Style.space(6)
+          Button {
+            Layout.fillWidth: true
+            text: root.tvOn ? "Power off" : "Power on"
+            foreground: root.foreground
+            onClicked: root.power()
+          }
+          Button { text: "Mute"; foreground: root.foreground; onClicked: root.run(["vol", "mute"]) }
+          Button { text: "Vol \u2212"; foreground: root.foreground; onClicked: root.volume("down") }
+          Button { text: "Vol +"; foreground: root.foreground; onClicked: root.volume("up") }
+        }
+
+        ColumnLayout {
+          Layout.alignment: Qt.AlignHCenter
           spacing: Style.space(4)
-          Button { text: "\u25C0"; foreground: root.foreground; implicitWidth: Style.space(72); onClicked: root.key("KEY_LEFT") }
-          Button { text: "OK"; foreground: root.foreground; implicitWidth: Style.space(72); onClicked: root.key("KEY_OK") }
-          Button { text: "\u25B6"; foreground: root.foreground; implicitWidth: Style.space(72); onClicked: root.key("KEY_RIGHT") }
+          Button { Layout.alignment: Qt.AlignHCenter; text: "\u25B2"; foreground: root.foreground; implicitWidth: Style.space(72); onClicked: root.key("KEY_UP") }
+          RowLayout {
+            spacing: Style.space(4)
+            Button { text: "\u25C0"; foreground: root.foreground; implicitWidth: Style.space(72); onClicked: root.key("KEY_LEFT") }
+            Button { text: "OK"; foreground: root.foreground; implicitWidth: Style.space(72); onClicked: root.key("KEY_OK") }
+            Button { text: "\u25B6"; foreground: root.foreground; implicitWidth: Style.space(72); onClicked: root.key("KEY_RIGHT") }
+          }
+          Button { Layout.alignment: Qt.AlignHCenter; text: "\u25BC"; foreground: root.foreground; implicitWidth: Style.space(72); onClicked: root.key("KEY_DOWN") }
         }
-        Button { Layout.alignment: Qt.AlignHCenter; text: "\u25BC"; foreground: root.foreground; implicitWidth: Style.space(72); onClicked: root.key("KEY_DOWN") }
-      }
 
-      RowLayout {
-        Layout.fillWidth: true
-        spacing: Style.space(6)
-        Button { Layout.fillWidth: true; text: "Back"; foreground: root.foreground; onClicked: root.key("KEY_RETURNS") }
-        Button { Layout.fillWidth: true; text: "Home"; foreground: root.foreground; onClicked: root.key("KEY_HOME") }
-        Button { Layout.fillWidth: true; text: "Menu"; foreground: root.foreground; onClicked: root.key("KEY_MENU") }
-      }
+        RowLayout {
+          Layout.fillWidth: true
+          spacing: Style.space(6)
+          Button { Layout.fillWidth: true; text: "Back"; foreground: root.foreground; onClicked: root.key("KEY_RETURNS") }
+          Button { Layout.fillWidth: true; text: "Home"; foreground: root.foreground; onClicked: root.key("KEY_HOME") }
+          Button { Layout.fillWidth: true; text: "Menu"; foreground: root.foreground; onClicked: root.key("KEY_MENU") }
+        }
 
-      PanelSectionHeader { Layout.fillWidth: true; text: "Inputs" }
-      Flow {
-        Layout.fillWidth: true
-        spacing: Style.space(6)
-        Repeater {
-          model: root.sources
-          delegate: Button {
-            required property var modelData
-            text: String(modelData.label || modelData.id || "")
-            foreground: root.foreground
-            active: root.tv.source === modelData.id
-            onClicked: root.setSource(String(modelData.id))
+        PanelSectionHeader { Layout.fillWidth: true; text: "Inputs" }
+        Flow {
+          Layout.fillWidth: true
+          spacing: Style.space(6)
+          Repeater {
+            model: root.sources
+            delegate: Button {
+              required property var modelData
+              text: String(modelData.label || modelData.id || "")
+              foreground: root.foreground
+              active: root.tv.source === modelData.id
+              onClicked: root.setSource(String(modelData.id))
+            }
           }
         }
-      }
 
-      PanelSectionHeader { Layout.fillWidth: true; text: "Apps" }
-      Flow {
-        Layout.fillWidth: true
-        spacing: Style.space(6)
-        Repeater {
-          model: root.apps
-          delegate: Button {
-            required property var modelData
-            text: String(modelData.name || "")
-            foreground: root.foreground
-            onClicked: root.launch(String(modelData.appId))
+        PanelSectionHeader { Layout.fillWidth: true; text: "Apps" }
+        Flow {
+          Layout.fillWidth: true
+          spacing: Style.space(6)
+          Repeater {
+            model: root.apps
+            delegate: Button {
+              required property var modelData
+              text: String(modelData.name || "")
+              foreground: root.foreground
+              onClicked: root.launch(String(modelData.appId))
+            }
           }
         }
-      }
 
-      Text {
-        Layout.fillWidth: true
-        visible: !root.paired
-        text: root.errorCode === "pairing_required"
-          ? "Pair first: scripts/vidaa.py pair --cert <cert.pem> --key <key.pem>"
-          : "Backend error: " + root.errorCode
-        color: bar ? bar.urgent : Color.urgent
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.bodySmall
-        wrapMode: Text.Wrap
-        textFormat: Text.PlainText
+        Text {
+          Layout.fillWidth: true
+          visible: root.displayError !== ""
+          text: root.displayError === "pairing_required"
+            ? "Pair first: scripts/vidaa.py pair --cert <cert.pem> --key <key.pem>"
+            : root.codeText(root.displayError)
+          color: bar ? bar.urgent : Color.urgent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.Wrap
+          textFormat: Text.PlainText
+        }
       }
     }
   }
