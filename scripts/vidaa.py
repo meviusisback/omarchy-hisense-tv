@@ -449,9 +449,15 @@ def _recvn(sock, count: int, deadline: float | None = None) -> bytes:
         if deadline is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise socket.timeout("packet deadline")
+                raise Fail("bad_packet", "packet deadline")
             sock.settimeout(min(remaining, 1.0))
-        chunk = sock.recv(count - len(buf))
+        try:
+            chunk = sock.recv(count - len(buf))
+        except socket.timeout:
+            if buf:
+                # Part of this packet is gone: the framing cannot be resumed.
+                raise Fail("bad_packet", "partial packet")
+            raise
         if not chunk:
             raise ConnectionError("eof")
         buf += chunk
@@ -632,8 +638,9 @@ class TvState:
 
     def document(self) -> dict:
         doc = self.summary()
-        doc.update({"updated": int(self.updated or time.time()), "boot_id": boot_id(),
-                    "pid": os.getpid(), "stale": False})
+        doc.update({"updated": int(self.updated or time.time()),
+                    "written": int(time.time()), "boot_id": boot_id(),
+                    "pid": os.getpid(), "stale": not self.available})
         if len(json.dumps(doc)) > MAX_STATE:
             doc["apps"] = []
             doc["appsTruncated"] = True
@@ -928,7 +935,7 @@ def daemon_main(lock_fd: int | None, status_fd: int | None) -> int:
         try:
             if cmd == "key":
                 key = payload.get("key")
-                if key not in KEYS:
+                if not isinstance(key, str) or key not in KEYS:
                     return {"id": rid, "ok": False, "code": "bad_request"}
                 mqtt.publish("/remoteapp/tv/remote_service/%s/actions/sendkey" % cid, key)
             elif cmd == "vol":
@@ -951,8 +958,12 @@ def daemon_main(lock_fd: int | None, status_fd: int | None) -> int:
                     return {"id": rid, "ok": False, "code": "bad_request"}
             elif cmd == "source":
                 src = payload.get("source")
+                if not isinstance(src, str) or not src or len(src) > 16:
+                    return {"id": rid, "ok": False, "code": "bad_request"}
+                if not all(c.isalnum() or c in "._-" for c in src):
+                    return {"id": rid, "ok": False, "code": "bad_request"}
                 known = src in SOURCES or any(entry.get("id") == src for entry in state.sources)
-                if not known or not isinstance(src, str):
+                if not known:
                     return {"id": rid, "ok": False, "code": "bad_request"}
                 mqtt.publish(ui + "changesource", json.dumps({"sourceid": src}))
             elif cmd == "app":
@@ -1065,7 +1076,7 @@ def daemon_main(lock_fd: int | None, status_fd: int | None) -> int:
 
             if mqtt is not None:
                 now = time.time()
-                if now >= next_ping:
+                if now >= next_ping and ping_sent == 0.0 and mqtt is not None:
                     try:
                         mqtt.ping()
                         ping_sent = now
@@ -1077,13 +1088,14 @@ def daemon_main(lock_fd: int | None, status_fd: int | None) -> int:
                 if mqtt is not None and now - last_inbound > STATE_REFRESH * 2:
                     disconnect()
                 if now >= next_refresh:
-                    try:
-                        ui = "/remoteapp/tv/ui_service/%s/actions/" % cid
-                        mqtt.publish(ui + "gettvstate", "")
-                        mqtt.publish("/remoteapp/tv/platform_service/%s/actions/getvolume" % cid, "")
-                    except (OSError, Fail):
-                        disconnect()
                     next_refresh = now + STATE_REFRESH
+                    if mqtt is not None:
+                        try:
+                            ui = "/remoteapp/tv/ui_service/%s/actions/" % cid
+                            mqtt.publish(ui + "gettvstate", "")
+                            mqtt.publish("/remoteapp/tv/platform_service/%s/actions/getvolume" % cid, "")
+                        except (OSError, Fail):
+                            disconnect()
                 write_state()
 
         # shutdown: remove state so a dead daemon is never shown as live
@@ -1360,8 +1372,10 @@ def cmd_pair(args) -> dict:
                     continue
                 parts = publish_parts(body)
                 if parts and predicate(parts[0]):
-                    return parse_json(parts[1].decode("utf-8", "replace"))
-
+                    # A matched topic with an unparseable payload still counts
+                    # as "seen": the caller only needs the dialog confirmation.
+                    return {"seen": True,
+                            "data": parse_json(parts[1].decode("utf-8", "replace"))}
             return None
 
         print("Look at the TV: a 4-digit pairing code should be on screen.")
@@ -1380,7 +1394,8 @@ def cmd_pair(args) -> dict:
         mqtt.publish("/remoteapp/tv/ui_service/%s/actions/authenticationcode" % cid,
                      json.dumps({"authNum": int(pin_code)}))
         result = await_response(lambda topic: topic.endswith("/data/authenticationcode"), 10)
-        if not isinstance(result, dict) or result.get("result") != 1:
+        payload = (result or {}).get("data") if isinstance(result, dict) else None
+        if not isinstance(payload, dict) or payload.get("result") != 1:
             raise Fail("pairing_required", "code rejected")
         mqtt.publish("/remoteapp/tv/ui_service/%s/actions/authenticationcodeclose" % cid, "")
 
@@ -1571,7 +1586,9 @@ def main(argv) -> int:
                 extra["level"] = int(args.level)
             return emit(cli_verb("vol", extra))
         if verb == "source":
-            if args.source not in SOURCES:
+            # The daemon validates against SOURCES plus whatever the TV's own
+            # sourcelist reported; here only the safe shape is enforced.
+            if not args.source or len(args.source) > 16:
                 raise Fail("bad_request", "unknown source")
             return emit(cli_verb("source", {"source": args.source}))
         if verb == "app":

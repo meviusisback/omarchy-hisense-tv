@@ -27,7 +27,7 @@ Panel {
   // document: a stale cache would otherwise claim the TV is live forever.
   property var tv: ({
     available: false, power: "unknown", statetype: "", volume: null, muted: false,
-    source: "", channel: "", app: "", apps: [], sources: [], stale: true
+    source: "", channel: "", app: "", apps: [], sources: [], written: 0, stale: true
   })
   property bool stateSeen: false
   property string statePath: ""
@@ -36,6 +36,7 @@ Panel {
   property bool busy: false
   property int pendingVolume: 0
   property string pendingKey: ""
+  property var pendingRun: null
 
   readonly property bool barShowsStatus: String(root.setting("barDisplay", "Status")).toLowerCase() === "status"
   readonly property bool showVolume: root.setting("showVolume", true) === true
@@ -101,7 +102,8 @@ Panel {
     // A document from a previous boot (or from a daemon that died hours ago)
     // is not live data. Leave stateSeen false so the fallback timer keeps
     // asking the CLI, which respawns the daemon.
-    var age = typeof parsed.updated === "number" ? (Date.now() / 1000 - parsed.updated) : Infinity
+    var stamp = typeof parsed.written === "number" ? parsed.written : parsed.updated
+    var age = typeof stamp === "number" ? (Date.now() / 1000 - stamp) : Infinity
     if (age < 0 || age > 180) {
       root.stateSeen = false
       return
@@ -117,6 +119,7 @@ Panel {
       app: typeof parsed.app === "string" ? parsed.app : "",
       apps: [],
       sources: [],
+      written: typeof stamp === "number" ? stamp : 0,
       stale: parsed.stale === true || parsed.available !== true
     }
     if (Array.isArray(parsed.apps)) {
@@ -148,7 +151,11 @@ Panel {
   }
 
   function run(args) {
-    if (root.busy) return
+    if (root.busy) {
+      // One slot is enough: the last explicit press is what the user meant.
+      root.pendingRun = args
+      return
+    }
     root.start(args)
   }
 
@@ -164,6 +171,12 @@ Panel {
 
   function pump() {
     if (root.busy) return
+    if (root.pendingRun !== null) {
+      var args = root.pendingRun
+      root.pendingRun = null
+      root.start(args)
+      return
+    }
     if (root.pendingVolume !== 0) {
       var step = root.pendingVolume
       root.pendingVolume = 0
@@ -218,10 +231,34 @@ Panel {
     path: root.statePath
     watchChanges: true
     printErrors: false
-    onLoadFailed: { /* no state yet: keep the previous one */ }
+    onLoadFailed: {
+      // The daemon unlinks the file on shutdown, so a missing document after
+      // a successful load means "backend gone", not "keep showing the cache".
+      if (!root.stateSeen) return
+      root.stateSeen = false
+      root.errorCode = root.errorCode || "tv_unreachable"
+      root.tv = Object.assign({}, root.tv, { stale: true })
+    }
     onLoaded: root.readState()
     // text() is stale inside the change signal, so reload() first.
     onFileChanged: reload()
+  }
+
+  // The document is only re-evaluated when it changes, so a daemon that died
+  // (or a file deleted on shutdown) needs an explicit age check to stop being
+  // shown as live.
+  Timer {
+    interval: 30000
+    repeat: true
+    running: true
+    onTriggered: {
+      if (!root.stateSeen) return
+      var stamp = root.tv.written || 0
+      if (stamp > 0 && Date.now() / 1000 - stamp < 120) return
+      root.stateSeen = false
+      root.tv = Object.assign({}, root.tv, { stale: true })
+      root.run(["status"])
+    }
   }
 
   // Only while no fresh state exists: re-ask for the path and refresh, slowly.
