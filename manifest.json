@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "id": "meviusisback.hisense-tv",
+  "name": "Hisense TV",
+  "version": "0.1.0",
+  "author": "meviusisback",
+  "license": "MIT",
+  "description": "Control a Hisense VIDAA TV from the Omarchy bar: power, volume, D-pad, inputs and app launch over the TV's local MQTT bus — no cloud, no account, no vendor app running.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Hisense TV",
+    "description": "Hisense VIDAA remote: power, volume, D-pad, inputs, apps.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "barDisplay": "Status",
+      "showVolume": true
+    },
+    "schema": [
+      {
+        "key": "barDisplay",
+        "type": "enum",
+        "label": "Bar display",
+        "options": ["Status", "Icon"],
+        "defaultValue": "Status",
+        "description": "Status shows the live channel/app and volume; Icon shows a single glyph."
+      },
+      {
+        "key": "showVolume",
+        "type": "boolean",
+        "label": "Show volume in the bar",
+        "defaultValue": true,
+        "description": "Append the current volume level while the TV is on."
+      }
+    ]
+  }
+}
