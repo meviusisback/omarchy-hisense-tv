@@ -17,6 +17,8 @@ header on :38400. Pairing is a 4-digit on-screen PIN. Keys are published to
 
 from __future__ import annotations
 
+import datetime
+import email.utils
 import errno
 import fcntl
 import hashlib
@@ -389,7 +391,13 @@ def tls_context(verify_anchor: str | None, cert: bytes, key: bytes) -> ssl.SSLCo
 
 
 def tv_timestamp(ip: str) -> int:
-    """The TV's own clock (RFC1123 Date header). Credentials are derived from it."""
+    """The TV's own clock (RFC1123 Date header). Credentials are derived from it.
+
+    An HTTP Date is always GMT. time.mktime() would read those wall-clock fields
+    as *local* time and shift the derived credentials by the host's UTC offset,
+    so the TV rejects the login and the daemon reports it as unreachable. Parse
+    the header as UTC instead, independent of the host's timezone.
+    """
     class NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, *args, **kwargs):
             return None
@@ -407,10 +415,14 @@ def tv_timestamp(ip: str) -> int:
     if not date:
         raise Fail("tv_unreachable", "no Date header")
     try:
-        ts = int(time.mktime(time.strptime(date, "%a, %d %b %Y %H:%M:%S %Z")))
-    except ValueError:
+        parsed = email.utils.parsedate_to_datetime(date)
+        if parsed is None:
+            raise ValueError("unparseable Date")
+        if parsed.tzinfo is None:  # a header without an explicit zone is still GMT
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        return int(parsed.timestamp())
+    except (TypeError, ValueError, OverflowError):
         raise Fail("tv_unreachable", "bad Date")
-    return ts
 
 
 def credentials(ts: int) -> tuple[str, str, str]:

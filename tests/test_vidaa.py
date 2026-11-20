@@ -16,6 +16,7 @@ import stat
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODULE = os.path.join(HERE, "..", "scripts", "vidaa.py")
@@ -69,6 +70,45 @@ class Credentials(unittest.TestCase):
 
     def test_client_id_is_stable(self):
         self.assertEqual(vidaa.credentials(1)[0], vidaa.credentials(2)[0])
+
+
+class TvClock(unittest.TestCase):
+    """The TV's Date header is GMT: credentials must not depend on the host TZ."""
+
+    def stamp(self, date):
+        class Resp:
+            headers = {"Date": date}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, count):
+                return b""
+
+        class Opener:
+            def open(self, url, timeout=3):
+                return Resp()
+
+        with mock.patch.object(vidaa.urllib.request, "build_opener", return_value=Opener()):
+            return vidaa.tv_timestamp("192.168.1.77")
+
+    def test_gmt_header_is_parsed_as_utc(self):
+        # time.mktime() reads these fields as local time (e.g. 1 h off on CET).
+        self.assertEqual(self.stamp("Thu, 12 Nov 2026 22:30:08 GMT"), 1794522608)
+
+    def test_explicit_offset_is_honoured(self):
+        self.assertEqual(self.stamp("Thu, 12 Nov 2026 23:30:08 +0100"), 1794522608)
+
+    def test_zone_without_offset_is_gmt(self):
+        self.assertEqual(self.stamp("Thu, 12 Nov 2026 22:30:08 UTC"), 1794522608)
+
+    def test_bad_date_is_unreachable(self):
+        with self.assertRaises(vidaa.Fail) as ctx:
+            self.stamp("not a date")
+        self.assertEqual(ctx.exception.code, "tv_unreachable")
 
 
 class AddressGuard(unittest.TestCase):
